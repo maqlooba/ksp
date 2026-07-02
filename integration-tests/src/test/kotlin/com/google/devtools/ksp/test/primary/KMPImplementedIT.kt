@@ -287,22 +287,50 @@ class AnnoOnProperty {
     }
 
     @Test
-    fun testNativeConfigurationCacheReuse() {
-        Assume.assumeFalse(System.getProperty("os.name").startsWith("Windows", ignoreCase = true))
+    fun testNativeCrossCompilationConfigurationCacheReuse() {
+        // The cross-compilation skip condition is only registered for targets that the current
+        // host cannot build natively: an Apple target on a Linux host.
+        Assume.assumeTrue(System.getProperty("os.name").startsWith("Linux", ignoreCase = true))
         val gradleRunner = GradleRunner.create().withProjectDir(project.root)
 
-        // Warmup build to download and extract Kotlin Native compiler
-        gradleRunner.withArguments(
-            "--no-configuration-cache",
-            ":workload-linuxX64:assemble"
-        ).build()
+        // Add a klib-only iosArm64 target to workload-linuxX64 and to its project dependency
+        // (:annotations), so that the skip condition has cross-compilation metadata of a
+        // project dependency to consult.
+        val buildScript = File(project.root, "workload-linuxX64/build.gradle.kts")
+        buildScript.writeText(
+            buildScript.readText().replace(
+                "linuxX64() {",
+                "iosArm64() {\n    }\n    linuxX64() {"
+            )
+        )
+        buildScript.appendText("\ndependencies {\n    add(\"kspIosArm64\", project(\":test-processor\"))\n}\n")
+        val annotationsBuildScript = File(project.root, "annotations/build.gradle.kts")
+        annotationsBuildScript.writeText(
+            annotationsBuildScript.readText().replace(
+                "linuxX64() {",
+                "iosArm64() {\n    }\n    linuxX64() {"
+            )
+        )
+        project.appendProperty("kotlin.native.enableKlibsCrossCompilation=true")
+        // Kotlin/Native provisioning during the first build changes ~/.konan, whose content is
+        // probed at configuration time; ignore it so the assertions below only measure inputs
+        // the build itself controls. The crossCompilationMetadata files this test guards
+        // against live in the dependency's build directory and are still tracked.
+        project.appendProperty(
+            "org.gradle.configuration-cache.inputs.unsafe.ignore.file-system-checks=~/.konan/**"
+        )
 
-        // First run: calculates and stores configuration cache
+        // Building the iosArm64 klib alone keeps the second build reusable on a cold ~/.konan:
+        // with a host-supported compilation in the graph, KGP records the content of the
+        // distribution's klib/platform/<host target> directory as a configuration input before
+        // the first build has provisioned it, and directory-content inputs are not covered by
+        // the file-system-checks ignore above.
         val result1 = gradleRunner.withArguments(
             "--configuration-cache",
             "--configuration-cache-problems=fail",
-            ":workload-linuxX64:assemble"
+            ":workload-linuxX64:compileKotlinIosArm64"
         ).build()
+        Assert.assertEquals(TaskOutcome.SUCCESS, result1.task(":workload-linuxX64:kspKotlinIosArm64")?.outcome)
         Assert.assertTrue(
             "Expected 'Configuration cache entry stored.' but output was:\n${result1.output}",
             result1.output.contains("Configuration cache entry stored.")
@@ -312,7 +340,7 @@ class AnnoOnProperty {
         val result2 = gradleRunner.withArguments(
             "--configuration-cache",
             "--configuration-cache-problems=fail",
-            ":workload-linuxX64:assemble"
+            ":workload-linuxX64:compileKotlinIosArm64"
         ).build()
         Assert.assertTrue(
             "Expected 'Reusing configuration cache.' but output was:\n${result2.output}",
